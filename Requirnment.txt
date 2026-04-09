@@ -1,0 +1,12 @@
+To run ,open the folder in terminal andd type npm run dev.
+
+Requirnments:
+
+"dependencies": 
+    "@tailwindcss/vite": "^4.1.11",
+    "framer-motion": "^12.23.24",
+    "react-dom": "^19.1.0",
+    "react-hook-form": "^7.62.0",
+    "react-router-dom": "^7.8.0",
+
+

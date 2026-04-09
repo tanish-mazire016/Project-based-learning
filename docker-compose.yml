@@ -1,0 +1,184 @@
+services:
+  # ────────────────────────────────────────────────────
+  # Infrastructure
+  # ────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: fraud_pipeline
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ────────────────────────────────────────────────────
+  # Backend API
+  # ────────────────────────────────────────────────────
+
+  backend:
+    build:
+      context: .
+      dockerfile: Backend/Dockerfile
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      - POSTGRES_HOST=postgres
+      - REDIS_URL=redis://redis:6379/0
+      - ML_DIR=/app/ML
+      - ML_MODELS_DIR=/app/ML/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      bash -c "
+        python manage.py migrate --noinput &&
+        python manage.py seed &&
+        gunicorn backend.wsgi:application --bind 0.0.0.0:8000 --workers 3 --timeout 120
+      "
+
+  # ────────────────────────────────────────────────────
+  # Celery Workers (one per queue)
+  # ────────────────────────────────────────────────────
+
+  worker-cleaning:
+    build:
+      context: .
+      dockerfile: Backend/Dockerfile
+    env_file: .env
+    environment:
+      - POSTGRES_HOST=postgres
+      - REDIS_URL=redis://redis:6379/0
+      - ML_DIR=/app/ML
+      - ML_MODELS_DIR=/app/ML/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A backend worker -Q cleaning_queue -l info --concurrency=${CLEANING_CONCURRENCY:-2}
+
+  worker-features:
+    build:
+      context: .
+      dockerfile: Backend/Dockerfile
+    env_file: .env
+    environment:
+      - POSTGRES_HOST=postgres
+      - REDIS_URL=redis://redis:6379/0
+      - ML_DIR=/app/ML
+      - ML_MODELS_DIR=/app/ML/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A backend worker -Q features_queue -l info --concurrency=${FEATURES_CONCURRENCY:-2}
+
+  worker-scoring:
+    build:
+      context: .
+      dockerfile: Backend/Dockerfile
+    env_file: .env
+    environment:
+      - POSTGRES_HOST=postgres
+      - REDIS_URL=redis://redis:6379/0
+      - ML_DIR=/app/ML
+      - ML_MODELS_DIR=/app/ML/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A backend worker -Q scoring_queue -l info --concurrency=${SCORING_CONCURRENCY:-2}
+
+  worker-decisions:
+    build:
+      context: .
+      dockerfile: Backend/Dockerfile
+    env_file: .env
+    environment:
+      - POSTGRES_HOST=postgres
+      - REDIS_URL=redis://redis:6379/0
+      - ML_DIR=/app/ML
+      - ML_MODELS_DIR=/app/ML/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A backend worker -Q decisions_queue -l info --concurrency=${DECISIONS_CONCURRENCY:-2}
+
+  worker-adaptive:
+    build:
+      context: .
+      dockerfile: Backend/Dockerfile
+    env_file: .env
+    environment:
+      - POSTGRES_HOST=postgres
+      - REDIS_URL=redis://redis:6379/0
+      - ML_DIR=/app/ML
+      - ML_MODELS_DIR=/app/ML/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A backend worker -Q adaptive_queue,audit_queue -l info --concurrency=${ADAPTIVE_CONCURRENCY:-1}
+
+  # ────────────────────────────────────────────────────
+  # Celery Beat Scheduler
+  # ────────────────────────────────────────────────────
+
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Backend/Dockerfile
+    env_file: .env
+    environment:
+      - POSTGRES_HOST=postgres
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A backend beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler 2>/dev/null || celery -A backend beat -l info
+
+  # ────────────────────────────────────────────────────
+  # React Frontend
+  # ────────────────────────────────────────────────────
+
+  frontend:
+    build:
+      context: ./Frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    volumes:
+      - ./Frontend/src:/app/src
+
+volumes:
+  pgdata:
