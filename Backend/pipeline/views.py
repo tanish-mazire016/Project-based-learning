@@ -17,6 +17,10 @@ Endpoints:
 
 import hashlib
 import io
+import collections
+
+from django.db import transaction
+from django.db.models import Count, Sum, Avg, F, Q
 import math
 import logging
 
@@ -24,14 +28,16 @@ import pandas as pd
 from django.conf import settings as django_settings
 from django.utils import timezone
 from rest_framework import status
-from rest_framework.decorators import api_view, parser_classes
+from rest_framework.decorators import api_view, parser_classes, permission_classes, authentication_classes
+from rest_framework.permissions import AllowAny
 from rest_framework.parsers import MultiPartParser
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
 
 from pipeline.models import (
-    Dataset, ReviewQueue, HumanFeedback, FraudRule, AppSetting, AuditLog,
-    ReviewStatus, DatasetStatus,
+    Dataset, Transaction, RejectedTransaction, RiskAssessment, Decision,
+    ReviewQueue, HumanFeedback, FraudRule, RuleVersion, AppSetting, AuditLog,
+    ReviewStatus, DatasetStatus, DecisionType, Verdict,
 )
 from pipeline.serializers import (
     DatasetSerializer, UploadResponseSerializer,
@@ -156,6 +162,7 @@ def _make_serializable(rows: list[dict]) -> list[dict]:
 
 
 @api_view(['GET'])
+@permission_classes([AllowAny])
 def dataset_status(request, dataset_id):
     """
     GET /api/ingestion/<dataset_id>/status
@@ -210,28 +217,29 @@ def claim_review(request, review_id):
 
     Claim a pending review. Returns 409 if already claimed.
     """
-    try:
-        review = ReviewQueue.objects.select_for_update().get(id=review_id)
-    except ReviewQueue.DoesNotExist:
-        return Response(
-            {'error': f'Review {review_id} not found'},
-            status=status.HTTP_404_NOT_FOUND,
-        )
+    with transaction.atomic():
+        try:
+            review = ReviewQueue.objects.select_for_update().get(id=review_id)
+        except ReviewQueue.DoesNotExist:
+            return Response(
+                {'error': f'Review {review_id} not found'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
 
-    if review.status != ReviewStatus.PENDING:
-        return Response(
-            {'error': f'Review is already {review.status}',
-             'claimed_by': review.claimed_by},
-            status=status.HTTP_409_CONFLICT,
-        )
+        if review.status != ReviewStatus.PENDING:
+            return Response(
+                {'error': f'Review is already {review.status}',
+                 'claimed_by': review.claimed_by},
+                status=status.HTTP_409_CONFLICT,
+            )
 
-    # Get current user — fallback to header or default
-    current_user = request.headers.get('X-User', 'analyst')
+        # Get current user — fallback to header or default
+        current_user = request.headers.get('X-User', 'analyst')
 
-    review.status = ReviewStatus.CLAIMED
-    review.claimed_by = current_user
-    review.claimed_at = timezone.now()
-    review.save(update_fields=['status', 'claimed_by', 'claimed_at'])
+        review.status = ReviewStatus.CLAIMED
+        review.claimed_by = current_user
+        review.claimed_at = timezone.now()
+        review.save(update_fields=['status', 'claimed_by', 'claimed_at'])
 
     return Response({
         'review_id': review.id,
@@ -359,3 +367,343 @@ def get_audit_logs(request):
     page = paginator.paginate_queryset(queryset, request)
     serializer = AuditLogSerializer(page, many=True)
     return paginator.get_paginated_response(serializer.data)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ANALYTICS DASHBOARD
+# ═══════════════════════════════════════════════════════════════════════════
+
+@api_view(['GET'])
+def analytics_dashboard(request):
+    """
+    GET /api/analytics/dashboard
+
+    Returns aggregated analytics data for the dashboard:
+      - KPI summary (total transactions, decisions breakdown, value protected)
+      - Risk score distribution (histogram buckets)
+      - Top triggered rules
+      - Review queue efficiency metrics
+      - Transaction type distribution
+      - Threshold change history
+    """
+    # ── KPI Summary ──
+    total_transactions = Transaction.objects.count()
+    total_rejected = RejectedTransaction.objects.count()
+    total_datasets = Dataset.objects.count()
+
+    # Decision breakdown
+    decision_counts = dict(
+        Decision.objects.values_list('decision_type')
+        .annotate(count=Count('id'))
+        .values_list('decision_type', 'count')
+    )
+    allowed_count = decision_counts.get('ALLOWED', 0)
+    blocked_count = decision_counts.get('BLOCKED', 0)
+    review_count = decision_counts.get('REVIEW', 0)
+    total_decisions = allowed_count + blocked_count + review_count
+
+    # Value protected (sum of amounts of BLOCKED transactions)
+    value_protected = Transaction.objects.filter(
+        decision__decision_type='BLOCKED'
+    ).aggregate(total=Sum('amount'))['total'] or 0
+
+    # Average risk score
+    avg_risk = RiskAssessment.objects.aggregate(
+        avg=Avg('risk_score')
+    )['avg'] or 0
+
+    # ── Risk Score Distribution (10 buckets: 0-0.1, 0.1-0.2, ..., 0.9-1.0) ──
+    risk_buckets = [0] * 10
+    risk_scores = RiskAssessment.objects.values_list('risk_score', flat=True)
+    for score in risk_scores:
+        bucket = min(int(score * 10), 9)
+        risk_buckets[bucket] += 1
+
+    risk_distribution = []
+    for i in range(10):
+        low = i * 0.1
+        high = (i + 1) * 0.1
+        risk_distribution.append({
+            'range': f'{low:.1f}-{high:.1f}',
+            'count': risk_buckets[i],
+        })
+
+    # ── Top Triggered Rules ──
+    rule_counter = collections.Counter()
+    assessments_with_rules = RiskAssessment.objects.exclude(
+        triggered_rules=[]
+    ).values_list('triggered_rules', flat=True)[:500]
+    for rules_list in assessments_with_rules:
+        if isinstance(rules_list, list):
+            for rule in rules_list:
+                name = rule.get('rule_name', 'unknown') if isinstance(rule, dict) else str(rule)
+                rule_counter[name] += 1
+    top_rules = [
+        {'name': name, 'count': count}
+        for name, count in rule_counter.most_common(10)
+    ]
+
+    # ── Review Queue Efficiency ──
+    review_pending = ReviewQueue.objects.filter(status='PENDING').count()
+    review_claimed = ReviewQueue.objects.filter(status='CLAIMED').count()
+    review_resolved = ReviewQueue.objects.filter(status='RESOLVED').count()
+
+    # Average resolution time (for resolved reviews)
+    resolved_reviews = ReviewQueue.objects.filter(
+        status='RESOLVED',
+        resolved_at__isnull=False,
+    )
+    avg_resolution_minutes = None
+    if resolved_reviews.exists():
+        from django.db.models import ExpressionWrapper, DurationField
+        durations = resolved_reviews.annotate(
+            duration=ExpressionWrapper(
+                F('resolved_at') - F('created_at'),
+                output_field=DurationField()
+            )
+        )
+        total_seconds = sum(
+            d.duration.total_seconds() for d in durations if d.duration
+        )
+        count = durations.count()
+        if count > 0:
+            avg_resolution_minutes = round(total_seconds / count / 60, 1)
+
+    # Human feedback verdict breakdown
+    verdict_counts = dict(
+        HumanFeedback.objects.values_list('verdict')
+        .annotate(count=Count('id'))
+        .values_list('verdict', 'count')
+    )
+
+    # ── Transaction Type Distribution ──
+    type_distribution = list(
+        Transaction.objects.values('transaction_type')
+        .annotate(count=Count('id'))
+        .order_by('-count')
+    )
+
+    # ── Model Accuracy (compare ML decision vs human feedback) ──
+    # Where humans reviewed and the ML had scored
+    feedback_records = HumanFeedback.objects.select_related(
+        'transaction__decision', 'transaction__risk_assessment'
+    ).all()[:200]
+
+    model_agreement = 0
+    model_disagreement = 0
+    for fb in feedback_records:
+        try:
+            decision = fb.transaction.decision
+            if fb.verdict == 'FRAUD' and decision.decision_type == 'BLOCKED':
+                model_agreement += 1
+            elif fb.verdict == 'LEGITIMATE' and decision.decision_type == 'ALLOWED':
+                model_agreement += 1
+            elif fb.verdict in ('FRAUD', 'LEGITIMATE'):
+                model_disagreement += 1
+        except Exception:
+            pass
+
+    total_compared = model_agreement + model_disagreement
+    model_accuracy = round(model_agreement / total_compared * 100, 1) if total_compared > 0 else None
+
+    # ── Threshold History (from RuleVersion) ──
+    threshold_changes = list(
+        RuleVersion.objects.filter(
+            threshold_before__isnull=False
+        ).order_by('-changed_at').values(
+            'threshold_before', 'threshold_after', 'changed_at', 'reason'
+        )[:20]
+    )
+    # Also include weight changes
+    weight_changes = list(
+        RuleVersion.objects.filter(
+            weight_before__isnull=False
+        ).order_by('-changed_at').values(
+            'rule__name', 'weight_before', 'weight_after', 'changed_at', 'reason'
+        )[:20]
+    )
+
+    # ── Recent Activity (last 10 audit events) ──
+    recent_events = list(
+        AuditLog.objects.order_by('-created_at').values(
+            'event_type', 'entity_type', 'entity_id', 'description', 'created_at'
+        )[:10]
+    )
+
+    return Response({
+        'kpi': {
+            'total_transactions': total_transactions,
+            'total_rejected': total_rejected,
+            'total_datasets': total_datasets,
+            'total_decisions': total_decisions,
+            'allowed_count': allowed_count,
+            'blocked_count': blocked_count,
+            'review_count': review_count,
+            'value_protected': round(value_protected, 2),
+            'avg_risk_score': round(avg_risk, 4),
+            'approval_rate': round(allowed_count / total_decisions * 100, 1) if total_decisions else 0,
+            'block_rate': round(blocked_count / total_decisions * 100, 1) if total_decisions else 0,
+            'review_rate': round(review_count / total_decisions * 100, 1) if total_decisions else 0,
+        },
+        'risk_distribution': risk_distribution,
+        'top_triggered_rules': top_rules,
+        'review_efficiency': {
+            'pending': review_pending,
+            'claimed': review_claimed,
+            'resolved': review_resolved,
+            'avg_resolution_minutes': avg_resolution_minutes,
+            'verdicts': verdict_counts,
+        },
+        'model_performance': {
+            'accuracy': model_accuracy,
+            'agreements': model_agreement,
+            'disagreements': model_disagreement,
+            'total_compared': total_compared,
+        },
+        'transaction_types': type_distribution,
+        'threshold_history': threshold_changes,
+        'weight_changes': weight_changes,
+        'recent_events': recent_events,
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RISK CLASSIFICATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ClassificationPagination(PageNumberPagination):
+    page_size = 25
+    page_size_query_param = 'page_size'
+    max_page_size = 100
+
+
+@api_view(['GET'])
+def classified_transactions(request):
+    """
+    GET /api/transactions/classified
+
+    Returns transactions categorized by risk level (Low / Medium / High).
+    Query params:
+      - risk_level: low | medium | high | all (default: all)
+      - sort: risk_score | amount | timestamp (default: risk_score)
+      - order: asc | desc (default: desc)
+      - type: transaction type filter (e.g., TRANSFER)
+      - page: page number
+    """
+    # Read thresholds from app_settings
+    allow_threshold = float(AppSetting.get('ALLOW_THRESHOLD', '0.30'))
+    block_threshold = float(AppSetting.get('BLOCK_THRESHOLD', '0.65'))
+
+    risk_level = request.query_params.get('risk_level', 'all').lower()
+    sort_by = request.query_params.get('sort', 'risk_score')
+    order = request.query_params.get('order', 'desc')
+    txn_type = request.query_params.get('type', '')
+
+    # Base queryset: transactions that have risk assessments
+    queryset = Transaction.objects.filter(
+        risk_assessment__isnull=False
+    ).select_related('risk_assessment', 'decision')
+
+    # Filter by transaction type
+    if txn_type:
+        queryset = queryset.filter(transaction_type=txn_type)
+
+    # Filter by risk level
+    if risk_level == 'low':
+        queryset = queryset.filter(risk_assessment__risk_score__lt=allow_threshold)
+    elif risk_level == 'medium':
+        queryset = queryset.filter(
+            risk_assessment__risk_score__gte=allow_threshold,
+            risk_assessment__risk_score__lt=block_threshold,
+        )
+    elif risk_level == 'high':
+        queryset = queryset.filter(risk_assessment__risk_score__gte=block_threshold)
+
+    # Sorting
+    sort_map = {
+        'risk_score': 'risk_assessment__risk_score',
+        'amount': 'amount',
+        'timestamp': 'timestamp',
+    }
+    sort_field = sort_map.get(sort_by, 'risk_assessment__risk_score')
+    if order == 'asc':
+        queryset = queryset.order_by(sort_field)
+    else:
+        queryset = queryset.order_by(f'-{sort_field}')
+
+    # Compute tier summary counts (on unfiltered-by-tier set)
+    all_assessed = Transaction.objects.filter(risk_assessment__isnull=False)
+    if txn_type:
+        all_assessed = all_assessed.filter(transaction_type=txn_type)
+
+    low_count = all_assessed.filter(risk_assessment__risk_score__lt=allow_threshold).count()
+    medium_count = all_assessed.filter(
+        risk_assessment__risk_score__gte=allow_threshold,
+        risk_assessment__risk_score__lt=block_threshold,
+    ).count()
+    high_count = all_assessed.filter(risk_assessment__risk_score__gte=block_threshold).count()
+
+    # Paginate
+    paginator = ClassificationPagination()
+    page = paginator.paginate_queryset(queryset, request)
+
+    # Serialize
+    results = []
+    for txn in page:
+        risk_score = None
+        ml_score = None
+        anomaly_score = None
+        triggered_rules = []
+        try:
+            ra = txn.risk_assessment
+            risk_score = ra.risk_score
+            ml_score = ra.ml_score
+            anomaly_score = ra.anomaly_score
+            triggered_rules = ra.triggered_rules or []
+        except Exception:
+            pass
+
+        decision_type = None
+        try:
+            decision_type = txn.decision.decision_type
+        except Exception:
+            pass
+
+        # Determine risk tier
+        if risk_score is not None:
+            if risk_score < allow_threshold:
+                tier = 'LOW'
+            elif risk_score < block_threshold:
+                tier = 'MEDIUM'
+            else:
+                tier = 'HIGH'
+        else:
+            tier = 'UNKNOWN'
+
+        results.append({
+            'id': txn.id,
+            'user_id': txn.user_id,
+            'merchant_id': txn.merchant_id,
+            'amount': txn.amount,
+            'transaction_type': txn.transaction_type,
+            'timestamp': txn.timestamp.isoformat(),
+            'risk_score': round(risk_score, 4) if risk_score else None,
+            'ml_score': round(ml_score, 2) if ml_score else None,
+            'anomaly_score': round(anomaly_score, 2) if anomaly_score else None,
+            'decision': decision_type,
+            'tier': tier,
+            'triggered_rules': [r.get('rule_name', '') for r in triggered_rules[:3]],
+        })
+
+    response = paginator.get_paginated_response(results)
+    response.data['tier_summary'] = {
+        'low': low_count,
+        'medium': medium_count,
+        'high': high_count,
+        'total': low_count + medium_count + high_count,
+        'thresholds': {
+            'allow': allow_threshold,
+            'block': block_threshold,
+        },
+    }
+    return response

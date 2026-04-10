@@ -67,6 +67,40 @@ FEATURE_COLUMNS = [
     'type_CASH_IN', 'type_CASH_OUT', 'type_DEBIT', 'type_PAYMENT', 'type_TRANSFER',
 ]
 
+# Minimum batch size for stable model predictions
+MIN_BATCH_SIZE = 32
+
+
+def _pad_batch(X: pd.DataFrame, target_size: int) -> pd.DataFrame:
+    """
+    Pad a small batch to target_size via oversampling with gaussian noise.
+
+    Duplicates existing rows and adds small noise to numeric features
+    to give the model sufficient variance for calibrated probabilities.
+    Binary/categorical columns are kept unchanged.
+    """
+    original_size = len(X)
+    pad_needed = target_size - original_size
+
+    # Columns that are continuous (add noise) vs binary (keep as-is)
+    noise_cols = ['amount', 'oldbalanceOrg', 'oldbalanceDest']
+    binary_cols = [c for c in X.columns if c not in noise_cols]
+
+    # Sample rows to duplicate (with replacement)
+    indices = np.random.choice(original_size, size=pad_needed, replace=True)
+    padded_rows = X.iloc[indices].copy().reset_index(drop=True)
+
+    # Add small gaussian noise to continuous features only
+    for col in noise_cols:
+        col_std = X[col].std()
+        if col_std > 0:
+            noise = np.random.normal(0, col_std * 0.01, size=pad_needed)
+            padded_rows[col] = padded_rows[col] + noise
+            # Ensure no negative values for amounts/balances
+            padded_rows[col] = padded_rows[col].clip(lower=0)
+
+    return pd.concat([X, padded_rows], ignore_index=True)
+
 
 def verify_rule_integrity(rule) -> bool:
     """
@@ -96,21 +130,18 @@ def score_transactions(feature_dicts: list[dict], rules: list) -> list[dict]:
       4. Normalize 0–100 → 0.0–1.0 for threshold comparison
       5. Match features against fraud rules
 
+    Dynamic Batch Sizing:
+      - If fewer than MIN_BATCH_SIZE features, pad via oversampling with
+        small gaussian noise to improve model confidence.
+      - After scoring, only return results for original transactions.
+
     Args:
         feature_dicts: List of dicts with keys matching FEATURE_COLUMNS,
                        plus 'transaction_id'.
         rules: List of FraudRule model instances.
 
     Returns:
-        List of dicts:
-        [{
-            'transaction_id': int,
-            'risk_score': float,       # 0.0–1.0
-            'ml_score': float,         # 0–100
-            'anomaly_score': float,    # 0–100
-            'triggered_rules': [...],
-            'rule_weights_snapshot': {...},
-        }]
+        List of dicts with risk_score, ml_score, anomaly_score, etc.
     """
     _load_models()
 
@@ -119,6 +150,7 @@ def score_transactions(feature_dicts: list[dict], rules: list) -> list[dict]:
 
     # Build DataFrame in the exact column order the models expect
     transaction_ids = [f['transaction_id'] for f in feature_dicts]
+    original_count = len(feature_dicts)
 
     # Map DB column names to model column names
     model_data = []
@@ -140,7 +172,18 @@ def score_transactions(feature_dicts: list[dict], rules: list) -> list[dict]:
 
     X = pd.DataFrame(model_data, columns=FEATURE_COLUMNS)
 
-    # ── 1. XGBoost inference ──
+    # ── Dynamic Batch Padding ──
+    padded = False
+    if len(X) < MIN_BATCH_SIZE:
+        padded = True
+        pad_count = MIN_BATCH_SIZE - len(X)
+        logger.info(
+            f"Batch padded from {original_count} to {MIN_BATCH_SIZE} "
+            f"(+{pad_count} synthetic samples) for model stability"
+        )
+        X = _pad_batch(X, MIN_BATCH_SIZE)
+
+    # ── 1. XGBoost inference (calibrated probabilities) ──
     y_pred_proba = _xgb_model.predict_proba(X)[:, 1]
     ml_scores = compute_ml_score(y_pred_proba)      # 0–100
 
@@ -153,6 +196,16 @@ def score_transactions(feature_dicts: list[dict], rules: list) -> list[dict]:
 
     # ── 4. Normalize to 0.0–1.0 ──
     normalized_scores = combined_scores / 100.0
+
+    # ── Discard padded results, keep only originals ──
+    if padded:
+        ml_scores = ml_scores[:original_count]
+        anomaly_scores = anomaly_scores[:original_count]
+        normalized_scores = normalized_scores[:original_count]
+        logger.info(
+            f"Discarded {MIN_BATCH_SIZE - original_count} padded results, "
+            f"returning {original_count} original scores"
+        )
 
     # ── 5. Build rule weights snapshot ──
     rule_weights_snapshot = {}
