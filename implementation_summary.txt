@@ -1,0 +1,475 @@
+================================================================================
+       FRAUD DETECTION SYSTEM — COMPREHENSIVE IMPLEMENTATION SUMMARY
+================================================================================
+  Project : PaySim Fraud Detection Pipeline
+  Status  : Production Ready
+  Updated : 2026-04-22
+================================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. PROJECT OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A production-ready fraud detection platform built on the PaySim synthetic
+financial transaction dataset. The system uses a hybrid machine learning
+approach — combining supervised (XGBoost) and unsupervised (Isolation Forest)
+models — to score every transaction for fraud risk in real-time.
+
+The platform supports:
+  - Bulk CSV/JSON/Excel ingestion with a multi-stage Celery pipeline
+  - Automated ALLOWED / REVIEW / BLOCKED decisions with configurable thresholds
+  - Human analyst review workflows with encrypted notes
+  - A tamper-evident audit chain for compliance
+  - An adaptive engine that auto-adjusts rule weights from analyst feedback
+  - Dynamic React dashboards connected to live API data
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. SYSTEM ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Three-tier architecture with a shared ML module:
+
+  [ React Frontend :5173 ]
+         |
+         | REST API (Axios + Vite proxy)
+         v
+  [ Django REST API :8000 ]  ←→  [ PostgreSQL :5432 ]
+         |
+         | Celery Tasks
+         v
+  [ Redis :6379 (Broker) ] ←→ [ Celery Workers x5 ]
+         |
+         | Shared feature module (ML/shared_features.py)
+         v
+  [ ML Models (XGBoost + Isolation Forest .pkl files) ]
+
+Directory Structure:
+  /ML        — Offline training pipeline (Python scripts + .pkl models)
+  /Backend   — Django API, Celery workers, PostgreSQL ORM
+  /Frontend  — React (Vite) dashboard application
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. FULL TECHNOLOGY STACK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  COMPONENT               TECHNOLOGY                   VERSION / ROLE
+  ─────────────────────────────────────────────────────────────────────────────
+  ML Models               XGBoost                      Supervised classifier
+  ML Models               Scikit-learn (IsolationForest) Anomaly detection
+  ML Data Processing      Pandas                       DataFrame manipulation
+  ML Data Processing      NumPy                        Numerical operations
+  ML Model Persistence    Joblib                       .pkl serialization
+  ML Evaluation           Scikit-learn metrics         Precision, Recall, F2
+
+  Backend Framework       Django 5.x                   Web framework + ORM
+  REST API                Django REST Framework (DRF)  API + Token auth
+  Async Tasks             Celery 5.6                   Distributed task queue
+  Message Broker          Redis 7 (Alpine Docker img)  Celery broker + backend
+  Database                PostgreSQL 16 (Alpine)       Relational storage
+  DB Driver               psycopg2-binary              Python ↔ PostgreSQL
+  Encryption              cryptography (AES-256-GCM)   Reviewer note encryption
+  Integrity               hashlib (SHA-256)             Rule & audit chain hashing
+  CORS                    django-cors-headers           React ↔ Django CORS
+  WSGI                    Gunicorn                     Production HTTP server
+
+  Frontend Framework      React 18                     UI library
+  Build Tool              Vite 7                       Dev server + bundler
+  Styling                 Tailwind CSS (via Vite plugin) Utility CSS
+  Charts                  Recharts                     Data visualization
+  HTTP Client             Axios                        API calls
+  Routing                 React Router                 Client-side routing
+
+  Infrastructure          Docker                       Containerization
+  Orchestration           Docker Compose               Multi-service management
+  Config Management       python-dotenv                .env file loading
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. ML PIPELINE — OFFLINE TRAINING (/ML)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FILES:
+  data_cleaning.py       — Raw PaySim CSV cleaning and validation
+  feature_engineering.py — Full offline feature engineering pipeline
+  shared_features.py     — SHARED module: canonical feature logic (see §5)
+  train.py               — Legacy combined training script
+  train_xgb.py           — XGBoost model training (uses scale_pos_weight)
+  train_isolation.py     — Isolation Forest model training
+  evaluate.py            — Model evaluation (Precision, Recall, F2, ROC-AUC)
+  risk_engine.py         — Score computation and risk categorization
+
+TRAINING PROCESS:
+  1. feature_engineering.py runs on cleaned PaySim CSV
+  2. Chronological train/test split (step-based, not random)
+  3. XGBoost trained with scale_pos_weight to handle class imbalance (~0.1%)
+  4. Isolation Forest trained on the same 12-feature X_train
+  5. Both models serialized to ML/models/ via Joblib
+     - xgb_model.pkl
+     - isolation_forest.pkl
+
+ENGINEERED FEATURES (12 total, model-expected order):
+  amount           — Transaction amount
+  oldbalanceOrg    — Sender balance before transaction
+  oldbalanceDest   — Receiver balance before transaction
+  hour             — Hour of day derived from PaySim 'step' (step % 24)
+  orig_txn_count   — Sender's transaction count in the batch
+  dest_txn_count   — Receiver's transaction count in the batch
+  high_amount      — Binary: 1 if amount > 95th percentile of batch
+  type_CASH_IN     — One-hot encoded transaction type (deterministic)
+  type_CASH_OUT    — One-hot encoded
+  type_DEBIT       — One-hot encoded
+  type_PAYMENT     — One-hot encoded
+  type_TRANSFER    — One-hot encoded
+
+EVALUATION METRICS (from evaluate.py):
+  - Precision, Recall, F2 Score at thresholds 0.5 and 0.9
+  - ROC-AUC
+  - Focus on recall: catching fraud is prioritized over false positive rate
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. SHARED FEATURE MODULE (ML/shared_features.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This is the single most critical integration file in the system.
+
+PROBLEM SOLVED:
+  Before this module, feature engineering was duplicated between the offline
+  training pipeline (feature_engineering.py) and the online backend inference
+  (feature_service.py). Any discrepancy would cause train/serve skew, where
+  the model scores live data using different feature values than it was trained
+  on — a silent, hard-to-detect bug.
+
+SOLUTION:
+  ML/shared_features.py is the canonical source of truth. It is imported by
+  BOTH the offline pipeline and the Django backend service. This guarantees
+  byte-for-byte identical feature transformations at training and inference time.
+
+KEY EXPORTS:
+  FEATURE_COLUMNS          — Ordered list of 12 feature names
+  ALL_TRANSACTION_TYPES    — ['CASH_IN', 'CASH_OUT', 'DEBIT', 'PAYMENT', 'TRANSFER']
+  compute_time_features()  — Derives 'hour' from PaySim 'step'
+  compute_frequency_features() — Computes orig/dest transaction counts per batch
+  compute_high_amount_flag() — Flags amount > 95th percentile (or max for small batches)
+  encode_transaction_type() — Deterministic one-hot encoding for all 5 types
+  build_feature_matrix()   — Orchestrates all transforms, returns 12-col DataFrame
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. HYBRID SCORING MECHANISM (ML/risk_engine.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The hybrid model fuses two complementary approaches:
+
+  STEP 1 — XGBoost (Supervised):
+    Input  : 12-feature vector
+    Output : Probability 0.0–1.0 for class "fraud"
+    Score  : ml_score = probability × 100 → range [0, 100]
+
+  STEP 2 — Isolation Forest (Unsupervised):
+    Input  : Same 12-feature vector
+    Output : decision_function scores (negative = anomalous)
+    Score  : inverted and Min-Max normalized → range [0, 100]
+
+  STEP 3 — Weighted Fusion:
+    final_score = (0.80 × ml_score) + (0.20 × anomaly_score)
+    Range: [0, 100]   (enforced with np.clip)
+
+  STEP 4 — Risk Categorization:
+    HIGH RISK    : final_score >= 80  (configurable)
+    MEDIUM RISK  : final_score >= 70  (configurable)
+    LOW RISK     : final_score < 70
+
+  STEP 5 — Normalization for DB storage:
+    risk_score = final_score / 100   → stored as [0.0, 1.0] in RiskAssessment
+
+RATIONALE FOR 80/20 WEIGHTING:
+  XGBoost is the primary signal (trained on labeled fraud data). The Isolation
+  Forest acts as a supplementary anomaly detector to catch novel fraud patterns
+  not seen during training. A minority 20% weight adds signal without
+  overshadowing the supervised model.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. BACKEND ARCHITECTURE (/Backend)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Django App: "backend"
+  settings.py  — All configuration loaded from .env via python-dotenv
+  celery.py    — Celery app instance with named queue routing
+  urls.py      — Top-level URL routing
+
+Django App: "pipeline"
+  models.py       — 13 ORM models (see §9)
+  views.py        — 25+ DRF API views and endpoints
+  urls.py         — API URL routing
+  serializers.py  — DRF serializers for all models
+  auth_views.py   — Login, logout, and token management
+  admin.py        — Django admin registrations
+
+SERVICES (/pipeline/services/):
+  cleaning_service.py   — Row validation and cleaning logic (Pandas)
+  feature_service.py    — Wraps shared_features.build_feature_matrix()
+  scoring_service.py    — Loads Joblib models, runs hybrid scoring
+  adaptive_service.py   — Adjusts rule weights from human feedback
+  audit_service.py      — Appends tamper-evident entries to AuditLog
+  encryption.py         — AES-256-GCM encrypt/decrypt for reviewer notes
+
+CELERY TASKS (/pipeline/tasks/):
+  cleaning.py    — Queue: cleaning_queue   — Validates and stores transactions
+  features.py    — Queue: features_queue   — Runs feature engineering per batch
+  scoring.py     — Queue: scoring_queue    — Runs hybrid model inference
+  decisions.py   — Queue: decisions_queue  — Applies thresholds, writes Decision
+  adaptive.py    — Queue: adaptive_queue   — Periodic rule weight recalibration
+  audit.py       — Queue: audit_queue      — Periodic audit chain verification
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. TRANSACTION PIPELINE — END TO END FLOW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  STAGE 1 — INGESTION
+    User uploads CSV/JSON/Excel via POST /api/ingestion/upload
+    Django parses file → creates Dataset record → dispatches Celery batches
+    Batch size: configurable via BATCH_SIZE env var (default: 1000 rows)
+
+  STAGE 2 — CLEANING (cleaning_queue)
+    cleaning_service.py validates each row:
+      - Required column checks (step, amount, type, nameOrig, nameDest, etc.)
+      - Type coercion and null removal
+      - Statistical outlier flagging (amount > 3σ)
+    Valid rows → Transaction table
+    Invalid rows → RejectedTransaction table
+    AuditLog entry: BATCH_CLEANED or BATCH_FAILED
+
+  STAGE 3 — FEATURE ENGINEERING (features_queue)
+    feature_service.py calls shared_features.build_feature_matrix()
+    Result: 12-column DataFrame saved as TransactionFeature records
+    AuditLog entry: FEATURES_ENGINEERED
+
+  STAGE 4 — RISK SCORING (scoring_queue)
+    scoring_service.py loads xgb_model.pkl and isolation_forest.pkl (singletons)
+    Runs hybrid scoring (§6)
+    RiskAssessment record written with:
+      - risk_score (0.0–1.0)
+      - ml_score (raw 0–100)
+      - anomaly_score (raw 0–100)
+      - triggered_rules (JSON list of matched fraud rules)
+    AuditLog entry: TRANSACTION_ASSESSED
+
+  STAGE 5 — DECISION (decisions_queue)
+    Dynamic thresholds read from AppSetting table:
+      ALLOW_THRESHOLD: default 0.30
+      BLOCK_THRESHOLD: default 0.65
+    Decision logic:
+      risk_score < ALLOW_THRESHOLD  → ALLOWED
+      risk_score > BLOCK_THRESHOLD  → BLOCKED
+      else                          → REVIEW (enters ReviewQueue)
+    AuditLog entry: DECISION_MADE
+
+  STAGE 6 — HUMAN REVIEW (ReviewQueue)
+    Analyst claims a review item via POST /api/reviews/<id>/claim
+    Views full transaction + risk scores + triggered rules
+    Submits verdict: FRAUD / LEGITIMATE / UNCERTAIN
+    Notes are encrypted with AES-256-GCM before storage
+    Feedback stored in HumanFeedback with SHA-256 integrity hash
+    AuditLog entry: FEEDBACK_SUBMITTED
+
+  STAGE 7 — ADAPTIVE ENGINE (adaptive_queue / Celery Beat)
+    Runs daily via Celery Beat scheduler
+    Analyzes recent HumanFeedback to evaluate rule performance
+    Adjusts FraudRule weights up/down based on hit rate vs false positive rate
+    Saves weight history to RuleVersion table
+    AuditLog entry: RULE_WEIGHTS_UPDATED
+
+  STAGE 8 — AUDIT CHAIN VERIFICATION (audit_queue / Celery Beat)
+    Runs every 6 hours via Celery Beat
+    Walks AuditLog entries in chronological order
+    Recomputes SHA-256 chain: SHA-256(prev_hash + event + entity + desc + ts)
+    Any mismatch → SecurityAlert created + CHAIN_VIOLATION event logged
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. DATABASE SCHEMA — 13 TABLES (PostgreSQL)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  TABLE                   PURPOSE
+  ─────────────────────────────────────────────────────────────────────────────
+  datasets                Uploaded file tracking (status, batch counts)
+  transactions            Cleaned transaction records (PaySim fields mapped)
+  rejected_transactions   Rows that failed cleaning validation
+  transaction_features    12 engineered features per transaction
+  fraud_rules             Configurable scoring rules with SHA-256 hash
+  rule_versions           Full history of weight/threshold changes
+  risk_assessments        Hybrid model scores per transaction
+  decisions               ALLOWED / REVIEW / BLOCKED verdicts
+  review_queue            Human review work items with priority + claim state
+  human_feedback          Analyst verdicts (FRAUD / LEGITIMATE / UNCERTAIN)
+  audit_logs              Tamper-evident SHA-256 chain of events
+  app_settings            Runtime key-value config (thresholds, batch size)
+  security_alerts         Audit chain integrity violation records
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+10. REST API ENDPOINTS (Django REST Framework)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Authentication (Token-based — Authorization: Token <key>)
+  ─────────────────────────────────────────────────────────
+  POST   /api/auth/login                 Get auth token
+  POST   /api/auth/logout                Invalidate token
+  GET    /api/auth/me                    Current user info
+
+  Ingestion
+  ─────────────────────────────────────────────────────────
+  POST   /api/ingestion/upload           Upload CSV/JSON/Excel file
+  GET    /api/ingestion/<id>/status      Dataset processing status
+
+  Transactions
+  ─────────────────────────────────────────────────────────
+  GET    /api/transactions/classified    Risk-classified transaction list
+
+  Human Review
+  ─────────────────────────────────────────────────────────
+  GET    /api/reviews/queue              Pending review queue
+  POST   /api/reviews/<id>/claim         Claim a review item
+  GET    /api/reviews/<id>/detail        Full transaction + risk detail
+  POST   /api/reviews/<id>/submit        Submit analyst verdict
+
+  Settings
+  ─────────────────────────────────────────────────────────
+  GET    /api/settings/thresholds        Current ALLOW/BLOCK thresholds
+  GET    /api/settings/rules             All active fraud rules
+  GET    /api/settings/audit-logs        Paginated audit log history
+
+  Analytics
+  ─────────────────────────────────────────────────────────
+  GET    /api/analytics/dashboard        Aggregated summary stats
+  GET    /api/analytics/hourly-activity  Per-hour transaction / fraud counts
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+11. FRONTEND — REACT DASHBOARD (/Frontend)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Authentication:
+  Login.jsx        — Username/password login form → stores DRF token
+  AuthContext.jsx  — React context for global auth state
+  ProtectedRoute.jsx — Route guard requiring valid token
+
+Pages / Sidebar Sections:
+  Overview.jsx              — Summary stats (total txns, fraud count, flagged)
+  Transaction.jsx           — Paginated transaction list with risk scores
+  Analytics.jsx             — Analytics dashboard container
+  HourlyActivity.jsx        — Live hourly bar/line chart (auto-refreshes 60s)
+  TransactionVolumeChart.jsx — Volume trend chart (API-driven)
+  AmountVsRiskScoreChart.jsx — Scatter plot of amount vs. risk score
+  RiskScoreHistogram.jsx    — Distribution of risk scores across all transactions
+  Alerts.jsx                — Active security alerts and audit violations
+  TransactionStatusCard.jsx — Card showing ALLOWED/REVIEW/BLOCKED breakdown
+
+API Client (src/api/client.js):
+  Axios instance with base URL and Authorization header injection
+  Functions: login, logout, getTransactions, getQueue, getHourlyActivity, etc.
+
+Charts all consume live API data with:
+  - React useState/useEffect for data fetching
+  - Loading spinners while data loads
+  - Error messages on API failure
+  - Auto-refresh polling where applicable (60-second interval)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+12. SECURITY FEATURES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Authentication      : DRF Token Authentication (per-user tokens)
+  Reviewer Notes      : AES-256-GCM encryption (cryptography library)
+  Feedback Integrity  : SHA-256 hash of (txn_id + verdict + confidence + ts)
+  Rule Integrity      : SHA-256 hash of rule config dict (tamper detection)
+  Audit Chain         : Linked SHA-256 chain across all AuditLog entries
+  Chain Verification  : Automated Celery task runs every 6 hours
+  Violation Alerts    : SecurityAlert created on any chain break
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+13. DOCKER DEPLOYMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+docker-compose.yml defines 9 services:
+
+  SERVICE             IMAGE/BUILD         PORT    ROLE
+  ─────────────────────────────────────────────────────────────────────────────
+  postgres            postgres:16-alpine  5432    Database
+  redis               redis:7-alpine      6379    Celery broker + result backend
+  backend             Backend/Dockerfile  8000    Django API (Gunicorn, 3 workers)
+  worker-cleaning     Backend/Dockerfile  —       Celery: cleaning_queue
+  worker-features     Backend/Dockerfile  —       Celery: features_queue
+  worker-scoring      Backend/Dockerfile  —       Celery: scoring_queue
+  worker-decisions    Backend/Dockerfile  —       Celery: decisions_queue
+  worker-adaptive     Backend/Dockerfile  —       Celery: adaptive_queue + audit_queue
+  celery-beat         Backend/Dockerfile  —       Celery periodic scheduler
+  frontend            Frontend/Dockerfile 5173    Vite dev server
+
+Backend startup command:
+  python manage.py migrate --noinput
+  python manage.py seed              (seeds FraudRules + AppSettings)
+  gunicorn backend.wsgi:application --bind 0.0.0.0:8000 --workers 3
+
+Environment variables (.env in project root):
+  DJANGO_SECRET_KEY    — Django cryptographic key
+  DEBUG                — True/False
+  POSTGRES_DB/USER/PASSWORD/HOST/PORT  — PostgreSQL credentials
+  REDIS_URL            — Redis connection string
+  ML_DIR / ML_MODELS_DIR  — Paths to ML models directory
+  ENCRYPTION_KEY       — 64-char hex AES-256 key
+  BATCH_SIZE           — Rows per Celery task (default 1000)
+
+Startup command:
+  docker-compose up --build
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+14. KEY IMPLEMENTATION DECISIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  DECISION                          RATIONALE
+  ─────────────────────────────────────────────────────────────────────────────
+  80/20 XGBoost / Isolation Forest  Supervised model is primary; anomaly
+                                    detection supplements for novel patterns
+
+  Shared feature module             Eliminates train/serve skew — single file
+                                    used by both training and inference
+
+  Named Celery queues               Each pipeline stage gets its own queue,
+                                    allowing independent scaling per stage
+
+  Dynamic thresholds in AppSetting  Thresholds can be tuned at runtime
+                                    without redeploying the application
+
+  SHA-256 audit chain               Provides tamper-evident compliance logging
+                                    suitable for financial audit requirements
+
+  AES-256-GCM for notes             Reviewer notes may contain PII; encryption
+                                    at rest protects analyst observations
+
+  Chronological train/test split    Financial fraud requires time-aware splits
+                                    to prevent data leakage from future events
+
+  Singleton model loading           Models are loaded once per Celery worker
+                                    process to avoid repeated disk I/O
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+15. ACCESS INFORMATION (LOCAL DOCKER SETUP)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Frontend Dashboard  : http://localhost:5173
+  Backend API         : http://localhost:8000/api/
+  Django Admin Panel  : http://localhost:8000/admin/
+  Default Admin Login : username=admin  password=adminpassword123
+
+================================================================================

@@ -707,3 +707,77 @@ def classified_transactions(request):
         },
     }
     return response
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HOURLY ACTIVITY ANALYTICS
+# ═══════════════════════════════════════════════════════════════════════════
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def hourly_activity(request):
+    """
+    GET /api/analytics/hourly-activity
+
+    Returns per-hour transaction and fraud/flagged counts aggregated from
+    the database. Used by HourlyActivity.jsx and TransactionVolumeChart.jsx
+    to display real-time hourly patterns.
+
+    Response format:
+        [
+            {"hour": "00", "transactions": 234, "frauds": 3, "flagged": 8},
+            {"hour": "01", "transactions": 180, "frauds": 2, "flagged": 4},
+            ...
+        ]
+
+    - transactions: total transaction count for this hour
+    - frauds: transactions where ground_truth_label = True (known fraud)
+    - flagged: transactions that were BLOCKED or sent to REVIEW
+    """
+    from django.db.models import Case, When, IntegerField, Value
+    from django.db.models.functions import ExtractHour
+
+    # Annotate transactions with their hour-of-day (from timestamp)
+    txn_qs = Transaction.objects.annotate(
+        txn_hour=ExtractHour('timestamp'),
+    )
+
+    # Group by hour, count total transactions and fraud labels
+    hour_data = (
+        txn_qs
+        .values('txn_hour')
+        .annotate(
+            transactions=Count('id'),
+            frauds=Count(
+                Case(
+                    When(ground_truth_label=True, then=Value(1)),
+                    output_field=IntegerField(),
+                )
+            ),
+            flagged=Count(
+                Case(
+                    When(
+                        decision__decision_type__in=['BLOCKED', 'REVIEW'],
+                        then=Value(1),
+                    ),
+                    output_field=IntegerField(),
+                )
+            ),
+        )
+        .order_by('txn_hour')
+    )
+
+    # Build full 24-hour array (fill missing hours with zeros)
+    hour_map = {entry['txn_hour']: entry for entry in hour_data}
+    result = []
+    for h in range(24):
+        entry = hour_map.get(h, {})
+        result.append({
+            'hour': f'{h:02d}',
+            'time': f'{h:02d}:00',
+            'transactions': entry.get('transactions', 0),
+            'frauds': entry.get('frauds', 0),
+            'flagged': entry.get('flagged', 0),
+        })
+
+    return Response(result)

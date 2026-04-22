@@ -1,24 +1,38 @@
-import React from 'react'
+import React, { useState, useEffect } from 'react'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts'
+import { getHourlyActivity } from '../../../api/client'
 
 const HourlyActivity = () => {
-    // TODO: Replace with actual API data
-    // API endpoint: GET /api/analytics/hourly-activity
-    // This helps identify peak fraud times and transaction patterns
-    const data = [
-        { hour: '00', transactions: 234, frauds: 3 },
-        { hour: '02', transactions: 180, frauds: 2 },
-        { hour: '04', transactions: 95, frauds: 1 },
-        { hour: '06', transactions: 550, frauds: 5 },
-        { hour: '08', transactions: 1200, frauds: 8 },
-        { hour: '10', transactions: 1850, frauds: 12 },
-        { hour: '12', transactions: 2100, frauds: 15 },
-        { hour: '14', transactions: 2300, frauds: 18 },
-        { hour: '16', transactions: 2050, frauds: 14 },
-        { hour: '18', transactions: 1620, frauds: 11 },
-        { hour: '20', transactions: 980, frauds: 7 },
-        { hour: '22', transactions: 450, frauds: 4 }
-    ]
+    const [data, setData] = useState([])
+    const [loading, setLoading] = useState(true)
+    const [error, setError] = useState(null)
+
+    useEffect(() => {
+        let cancelled = false
+
+        const fetchData = async () => {
+            setLoading(true)
+            setError(null)
+            try {
+                const result = await getHourlyActivity()
+                if (!cancelled) setData(result)
+            } catch (err) {
+                console.error('Failed to fetch hourly activity:', err)
+                if (!cancelled) setError('Failed to load hourly data')
+            } finally {
+                if (!cancelled) setLoading(false)
+            }
+        }
+
+        fetchData()
+        // Auto-refresh every 60 seconds
+        const interval = setInterval(fetchData, 60000)
+
+        return () => {
+            cancelled = true
+            clearInterval(interval)
+        }
+    }, [])
 
     const CustomTooltip = ({ active, payload, label }) => {
         if (!active || !payload?.length) return null
@@ -37,6 +51,30 @@ const HourlyActivity = () => {
         "rounded-2xl border border-white/10 bg-gradient-to-br from-slate-900 via-slate-950 to-slate-900/95 " +
         "shadow-[0_18px_45px_rgba(15,23,42,0.75)] p-6";
 
+    if (loading && data.length === 0) {
+        return (
+            <div className={cardClass}>
+                <div className="mb-4">
+                    <h2 className="text-lg font-semibold text-white">Hourly Activity Pattern</h2>
+                    <p className="text-sm text-slate-300/80">Loading data...</p>
+                </div>
+                <div style={{ height: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <div className="text-slate-400 text-sm">Loading hourly activity...</div>
+                </div>
+            </div>
+        )
+    }
+
+    if (error && data.length === 0) {
+        return (
+            <div className={cardClass}>
+                <div className="mb-4">
+                    <h2 className="text-lg font-semibold text-white">Hourly Activity Pattern</h2>
+                    <p className="text-sm text-red-400">{error}</p>
+                </div>
+            </div>
+        )
+    }
 
     return (
         <div className={cardClass}>

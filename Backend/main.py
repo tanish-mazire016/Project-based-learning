@@ -1,72 +1,54 @@
+"""
+╔═══════════════════════════════════════════════════════════════════════╗
+║                    ⚠️  DEPRECATED — DO NOT USE  ⚠️                    ║
+║                                                                       ║
+║  This FastAPI server has been superseded by the Django backend.        ║
+║                                                                       ║
+║  The Django backend provides:                                         ║
+║    - Full REST API (DRF)    → python manage.py runserver              ║
+║    - Authentication         → Token-based via /api/auth/login         ║
+║    - Celery task pipeline   → celery -A backend worker                ║
+║    - ML model inference     → XGBoost + Isolation Forest scoring      ║
+║    - All endpoints          → /api/ingestion, /api/reviews, etc.      ║
+║                                                                       ║
+║  To start the Django backend:                                         ║
+║    cd Backend                                                         ║
+║    python manage.py runserver 0.0.0.0:8000                            ║
+║                                                                       ║
+║  This file is kept for historical reference only.                     ║
+╚═══════════════════════════════════════════════════════════════════════╝
+"""
+
+import warnings
+warnings.warn(
+    "main.py (FastAPI) is DEPRECATED. Use the Django backend instead: "
+    "python manage.py runserver",
+    DeprecationWarning,
+    stacklevel=1,
+)
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI()
+app = FastAPI(
+    title="DEPRECATED — Use Django Backend",
+    description="This FastAPI app is deprecated. Use the Django backend instead.",
+)
 
-# ✅ FIXED: Allow both Vite (5173) and Create React App (3000)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",  # Create React App
-        "http://localhost:5173",  # Vite
-        "http://127.0.0.1:3000",  # Alternative localhost
-        "http://127.0.0.1:5173",  # Alternative localhost
-    ],
-    allow_credentials=True,  # ✅ Add this
+    allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# Request model
-class LoginRequest(BaseModel):
-    email: str
-    password: str
-    role: str
-
-
-# Dummy users with complete details
-USERS = [
-    {
-        "name": "Mohan Sharma",
-        "email": "mohansharma@abcbank.com",
-        "password": "123456",
-        "role": "Risk Analyst",
-        "contact": "+91 98765 43210",
-    },
-    {
-        "name": "Admin User",
-        "email": "admin@bank.com",
-        "password": "admin123",
-        "role": "Administrator",
-        "contact": "+91 99999 88888",
-    },
-]
-
-
 @app.get("/")
 def read_root():
-    return {"message": "Fraud Detection API is running!"}
-
-
-@app.post("/login")
-def login(data: LoginRequest):
-    for user in USERS:
-        if (
-            user["email"] == data.email
-            and user["password"] == data.password
-            and user["role"] == data.role
-        ):
-            # Return user details (don't send password)
-            return {
-                "message": "Login successful",
-                "user": {
-                    "name": user["name"],
-                    "email": user["email"],
-                    "role": user["role"],
-                    "contact": user["contact"],
-                },
-            }
-
-    raise HTTPException(status_code=401, detail="Invalid credentials")
+    return {
+        "message": "⚠️ This FastAPI server is DEPRECATED.",
+        "action": "Use the Django backend: python manage.py runserver",
+        "django_api": "http://localhost:8000/api/",
+    }

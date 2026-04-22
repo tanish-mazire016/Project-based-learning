@@ -1,35 +1,53 @@
 """
-Feature Engineering Service — bridges feature_engineering.py logic into the pipeline.
+Feature Engineering Service — bridges shared feature logic into the pipeline.
 
-Adapts the feature engineering functions from ML/feature_engineering.py
-for batch operation on transaction records from the database.
+Uses the shared feature engineering module (ML/shared_features.py) to compute
+features for transaction batches from the database. This ensures identical
+transformations between offline training and online inference.
 
 The original ML/feature_engineering.py is NOT modified.
 """
 
+import os
+import sys
 import pandas as pd
 import numpy as np
 import logging
 
+from django.conf import settings
+
 logger = logging.getLogger(__name__)
 
-# The 12 feature columns that match what the pre-trained models expect
-FEATURE_COLUMNS = [
-    'amount', 'oldbalanceOrg', 'oldbalanceDest',
-    'hour', 'orig_txn_count', 'dest_txn_count', 'high_amount',
-    'type_CASH_IN', 'type_CASH_OUT', 'type_DEBIT', 'type_PAYMENT', 'type_TRANSFER',
-]
+# ─────────────────────────────────────────────────────────────────────────────
+# Import shared feature module from ML directory
+# ─────────────────────────────────────────────────────────────────────────────
+_ml_dir = getattr(settings, 'ML_DIR', os.path.join(os.path.dirname(__file__), '..', '..', '..', 'ML'))
+if _ml_dir not in sys.path:
+    sys.path.insert(0, _ml_dir)
+
+from shared_features import (
+    FEATURE_COLUMNS,
+    compute_time_features,
+    compute_frequency_features,
+    compute_high_amount_flag,
+    encode_transaction_type,
+)
 
 
 def compute_features(transactions: list[dict]) -> list[dict]:
     """
     Compute engineered features for a batch of transactions.
 
-    Replicates the logic from feature_engineering.py:
-      1. create_time_features()    → hour from step
-      2. create_frequency_features() → orig_txn_count, dest_txn_count
-      3. create_high_amount_flag()  → top 5% by amount
-      4. encode_categorical_features() → one-hot encode transaction type
+    Uses the shared feature module (ML/shared_features.py) to guarantee
+    identical logic between training and inference. Transforms database
+    transaction records into the 12-column feature format expected by
+    the pre-trained XGBoost and Isolation Forest models.
+
+    Feature pipeline (matches ML/feature_engineering.py exactly):
+      1. compute_time_features()      → hour from step
+      2. compute_frequency_features() → orig_txn_count, dest_txn_count
+      3. compute_high_amount_flag()   → top 5% by amount
+      4. encode_transaction_type()    → one-hot encode transaction type
 
     Args:
         transactions: List of transaction dicts with keys:
@@ -45,7 +63,7 @@ def compute_features(transactions: list[dict]) -> list[dict]:
     df = pd.DataFrame(transactions)
 
     # ------------------------------------------------------------------
-    # Reconstruct PaySim-shaped columns for feature engineering
+    # Reconstruct PaySim-shaped columns for the shared feature module
     # ------------------------------------------------------------------
     # Extract balance fields from location_metadata
     df['oldbalanceOrg'] = df['location_metadata'].apply(
@@ -55,42 +73,24 @@ def compute_features(transactions: list[dict]) -> list[dict]:
         lambda m: float(m.get('oldbalanceDest', 0)) if isinstance(m, dict) else 0
     )
 
-    # Rename to match feature_engineering.py expectations
+    # Rename to match shared module expectations (PaySim column names)
     df['nameOrig'] = df['user_id']
     df['nameDest'] = df['merchant_id']
     df['type'] = df['transaction_type']
 
     # ------------------------------------------------------------------
-    # 1. Time features (from create_time_features)
+    # Apply shared feature engineering (same logic as offline pipeline)
     # ------------------------------------------------------------------
-    df['hour'] = (df['step'] % 24).astype(int)
+    df = compute_time_features(df)
+    df = compute_frequency_features(df)
+    df = compute_high_amount_flag(df)
+    df = encode_transaction_type(df)
 
-    # ------------------------------------------------------------------
-    # 2. Frequency features (from create_frequency_features)
-    # ------------------------------------------------------------------
-    orig_counts = df.groupby('nameOrig').size()
-    df['orig_txn_count'] = df['nameOrig'].map(orig_counts).astype(int)
-
-    dest_counts = df.groupby('nameDest').size()
-    df['dest_txn_count'] = df['nameDest'].map(dest_counts).astype(int)
-
-    # ------------------------------------------------------------------
-    # 3. High amount flag (from create_high_amount_flag)
-    # ------------------------------------------------------------------
-    if len(df) >= 20:
-        threshold = df['amount'].quantile(0.95)
-    else:
-        # For very small batches, use a sensible default
-        threshold = df['amount'].max()
-    df['high_amount'] = (df['amount'] > threshold).astype(int)
-
-    # ------------------------------------------------------------------
-    # 4. One-hot encode transaction type (from encode_categorical_features)
-    # ------------------------------------------------------------------
-    all_types = ['CASH_IN', 'CASH_OUT', 'DEBIT', 'PAYMENT', 'TRANSFER']
-    for t in all_types:
-        col_name = f'type_{t}'
-        df[col_name] = (df['type'] == t).astype(int)
+    # Validate feature columns exist
+    missing_cols = [c for c in FEATURE_COLUMNS if c not in df.columns]
+    if missing_cols:
+        logger.error(f"Missing feature columns after engineering: {missing_cols}")
+        raise ValueError(f"Feature engineering produced incomplete columns: {missing_cols}")
 
     # ------------------------------------------------------------------
     # Build output: one feature dict per transaction
@@ -114,5 +114,8 @@ def compute_features(transactions: list[dict]) -> list[dict]:
         }
         results.append(feature_dict)
 
-    logger.info(f"Computed features for {len(results)} transactions")
+    logger.info(
+        f"Computed features for {len(results)} transactions "
+        f"(columns: {len(FEATURE_COLUMNS)}, batch_size: {len(df)})"
+    )
     return results

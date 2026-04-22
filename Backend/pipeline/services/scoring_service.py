@@ -3,7 +3,13 @@ Scoring Service — bridges risk_engine.py + pre-trained models into the pipelin
 
 Loads the pre-trained XGBoost and Isolation Forest models from ML/models/
 and uses risk_engine.py functions (compute_ml_score, compute_anomaly_score,
-combine_scores) for inference.
+combine_scores) for hybrid risk scoring.
+
+Hybrid scoring mechanism:
+  1. XGBoost  → predict_proba → compute_ml_score()      → 0-100
+  2. IsoForest → decision_function → compute_anomaly_score() → 0-100
+  3. combine_scores() → 80% ML + 20% Anomaly             → 0-100
+  4. Normalize to 0.0-1.0 for threshold comparison
 
 The original ML files are NOT modified. Models are NOT retrained.
 """
@@ -13,6 +19,7 @@ import sys
 import hashlib
 import json
 import logging
+import time
 
 import joblib
 import numpy as np
@@ -22,23 +29,33 @@ from django.conf import settings
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Add ML directory to path so we can import risk_engine functions
+# Add ML directory to path so we can import risk_engine and shared_features
 # ---------------------------------------------------------------------------
 _ml_dir = getattr(settings, 'ML_DIR', os.path.join(os.path.dirname(__file__), '..', '..', '..', 'ML'))
 if _ml_dir not in sys.path:
     sys.path.insert(0, _ml_dir)
 
 from risk_engine import compute_ml_score, compute_anomaly_score, combine_scores
+from shared_features import FEATURE_COLUMNS
 
 # ---------------------------------------------------------------------------
-# Model singleton — loaded once per process
+# Model singleton — loaded once per worker process
 # ---------------------------------------------------------------------------
 _xgb_model = None
 _iso_model = None
 
 
 def _load_models():
-    """Load pre-trained models from disk (once per worker process)."""
+    """
+    Load pre-trained XGBoost and Isolation Forest models from disk.
+
+    Models are loaded once per worker process (singleton pattern).
+    Subsequent calls are no-ops unless a model failed to load previously.
+
+    Raises:
+        FileNotFoundError: If model files are missing from ML_MODELS_DIR.
+        Exception: If model files are corrupted or incompatible.
+    """
     global _xgb_model, _iso_model
 
     if _xgb_model is not None and _iso_model is not None:
@@ -49,23 +66,33 @@ def _load_models():
     xgb_path = os.path.join(models_dir, 'xgb_model.pkl')
     iso_path = os.path.join(models_dir, 'isolation_forest.pkl')
 
-    logger.info(f"Loading XGBoost model from {xgb_path}")
-    _xgb_model = joblib.load(xgb_path)
+    # Validate files exist before attempting to load
+    for path, name in [(xgb_path, 'XGBoost'), (iso_path, 'Isolation Forest')]:
+        if not os.path.exists(path):
+            logger.error(f"{name} model file not found: {path}")
+            raise FileNotFoundError(
+                f"{name} model file not found at {path}. "
+                f"Run train_xgb.py / train_isolation.py first."
+            )
 
-    logger.info(f"Loading Isolation Forest model from {iso_path}")
-    _iso_model = joblib.load(iso_path)
+    try:
+        logger.info(f"Loading XGBoost model from {xgb_path} "
+                    f"({os.path.getsize(xgb_path) / 1024:.1f} KB)")
+        _xgb_model = joblib.load(xgb_path)
+    except Exception as exc:
+        logger.exception(f"Failed to load XGBoost model from {xgb_path}")
+        raise RuntimeError(f"Corrupt or incompatible XGBoost model: {exc}") from exc
+
+    try:
+        logger.info(f"Loading Isolation Forest model from {iso_path} "
+                    f"({os.path.getsize(iso_path) / 1024:.1f} KB)")
+        _iso_model = joblib.load(iso_path)
+    except Exception as exc:
+        _xgb_model = None  # Reset so next call retries both
+        logger.exception(f"Failed to load Isolation Forest model from {iso_path}")
+        raise RuntimeError(f"Corrupt or incompatible Isolation Forest model: {exc}") from exc
 
     logger.info("Both models loaded successfully")
-
-
-# ---------------------------------------------------------------------------
-# Feature column order (must match training data exactly)
-# ---------------------------------------------------------------------------
-FEATURE_COLUMNS = [
-    'amount', 'oldbalanceOrg', 'oldbalanceDest',
-    'hour', 'orig_txn_count', 'dest_txn_count', 'high_amount',
-    'type_CASH_IN', 'type_CASH_OUT', 'type_DEBIT', 'type_PAYMENT', 'type_TRANSFER',
-]
 
 # Minimum batch size for stable model predictions
 MIN_BATCH_SIZE = 32
@@ -184,18 +211,27 @@ def score_transactions(feature_dicts: list[dict], rules: list) -> list[dict]:
         X = _pad_batch(X, MIN_BATCH_SIZE)
 
     # ── 1. XGBoost inference (calibrated probabilities) ──
+    t_start = time.perf_counter()
     y_pred_proba = _xgb_model.predict_proba(X)[:, 1]
     ml_scores = compute_ml_score(y_pred_proba)      # 0–100
+    t_xgb = time.perf_counter() - t_start
 
     # ── 2. Isolation Forest inference ──
+    t_start = time.perf_counter()
     anomaly_raw = _iso_model.decision_function(X)
     anomaly_scores = compute_anomaly_score(anomaly_raw)  # 0–100
+    t_iso = time.perf_counter() - t_start
 
     # ── 3. Combine with 80/20 weighting ──
     combined_scores = combine_scores(ml_scores, anomaly_scores)  # 0–100
 
     # ── 4. Normalize to 0.0–1.0 ──
     normalized_scores = combined_scores / 100.0
+
+    logger.info(
+        f"Inference timing: XGBoost={t_xgb:.3f}s, IsoForest={t_iso:.3f}s "
+        f"(batch_size={len(X)})"
+    )
 
     # ── Discard padded results, keep only originals ──
     if padded:
@@ -226,7 +262,7 @@ def score_transactions(feature_dicts: list[dict], rules: list) -> list[dict]:
             'rule_weights_snapshot': rule_weights_snapshot,
         })
 
-    logger.info(f"Scored {len(results)} transactions")
+    logger.info(f"Scored {len(results)} transactions (avg_risk={np.mean(normalized_scores[:original_count]):.4f})")
     return results
 
 

@@ -1,8 +1,9 @@
 // TransactionVolumeChart.jsx
-import React from 'react'
+import React, { useState, useEffect } from 'react'
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid
 } from 'recharts'
+import { getHourlyActivity } from '../../api/client'
 
 
 const TransactionVolumeChart = () => {
@@ -11,22 +12,42 @@ const TransactionVolumeChart = () => {
     'rounded-2xl border border-white/10 bg-white/5 backdrop-blur-xl ' +
     'shadow-[0_18px_45px_rgba(15,23,42,0.75)]'
 
-  // TODO: Replace with actual API data
-  // Fetch transaction volume data from your backend
-  const volumeData = [
-    { time: '00:00', total: 234, flagged: 8 },
-    { time: '02:00', total: 180, flagged: 4 },
-    { time: '04:00', total: 95, flagged: 2 },
-    { time: '06:00', total: 550, flagged: 18 },
-    { time: '08:00', total: 880, flagged: 25 },
-    { time: '10:00', total: 920, flagged: 32 },
-    { time: '12:00', total: 1150, flagged: 45 },
-    { time: '14:00', total: 1050, flagged: 38 },
-    { time: '16:00', total: 780, flagged: 28 },
-    { time: '18:00', total: 620, flagged: 20 },
-    { time: '20:00', total: 450, flagged: 12 },
-    { time: '22:00', total: 310, flagged: 8 }
-  ]
+  const [volumeData, setVolumeData] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+
+  useEffect(() => {
+    let cancelled = false
+
+    const fetchData = async () => {
+      setLoading(true)
+      setError(null)
+      try {
+        const result = await getHourlyActivity()
+        // Map API response to chart format (uses 'time' field for x-axis)
+        const mapped = result.map(entry => ({
+          time: entry.time || `${entry.hour}:00`,
+          total: entry.transactions || 0,
+          flagged: entry.flagged || 0,
+        }))
+        if (!cancelled) setVolumeData(mapped)
+      } catch (err) {
+        console.error('Failed to fetch transaction volume:', err)
+        if (!cancelled) setError('Failed to load volume data')
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+
+    fetchData()
+    // Auto-refresh every 60 seconds
+    const interval = setInterval(fetchData, 60000)
+
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [])
 
   // Custom Tooltip Component
   const VolumeTooltip = ({ active, payload, label }) => {
@@ -44,12 +65,41 @@ const TransactionVolumeChart = () => {
     )
   }
 
+  if (loading && volumeData.length === 0) {
+    return (
+      <div className={`${cardClass} p-6`}>
+        <div className="flex items-start justify-between mb-4">
+          <div>
+            <h2 className="text-lg font-semibold text-white">Transaction Volume</h2>
+            <p className="text-sm text-slate-300">Loading data...</p>
+          </div>
+        </div>
+        <div style={{ height: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div className="text-slate-400 text-sm">Loading transaction volume...</div>
+        </div>
+      </div>
+    )
+  }
+
+  if (error && volumeData.length === 0) {
+    return (
+      <div className={`${cardClass} p-6`}>
+        <div className="flex items-start justify-between mb-4">
+          <div>
+            <h2 className="text-lg font-semibold text-white">Transaction Volume</h2>
+            <p className="text-sm text-red-400">{error}</p>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className={`${cardClass} p-6`}>
       <div className="flex items-start justify-between mb-4">
         <div>
           <h2 className="text-lg font-semibold text-white">Transaction Volume</h2>
-          <p className="text-sm text-slate-300">Today&apos;s activity over time</p>
+          <p className="text-sm text-slate-300">Activity distribution over time</p>
         </div>
         <div className="flex items-center gap-4 text-sm">
           <div className="flex items-center gap-2">

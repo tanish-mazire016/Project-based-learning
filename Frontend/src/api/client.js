@@ -120,3 +120,8 @@ export async function getAnalyticsDashboard() {
   const res = await client.get("/analytics/dashboard");
   return res.data;
 }
+
+export async function getHourlyActivity() {
+  const res = await client.get("/analytics/hourly-activity");
+  return res.data;
+}

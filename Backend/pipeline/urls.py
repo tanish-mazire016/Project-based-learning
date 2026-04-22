@@ -34,4 +34,5 @@ urlpatterns = [
 
     # ── Analytics Dashboard ──
     path('analytics/dashboard', views.analytics_dashboard, name='analytics-dashboard'),
+    path('analytics/hourly-activity', views.hourly_activity, name='hourly-activity'),
 ]

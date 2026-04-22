@@ -40,16 +40,24 @@ def combine_scores(ml_score, anomaly_score):
     # Ensure final score strictly stays within 0 and 100
     return np.clip(final_score, 0, 100)
 
-def categorize_risk(score):
+def categorize_risk(score, high_threshold=80, medium_threshold=70):
     """
-    Categorize a final numerical risk score into a risk bucket:
-      - >= 90: HIGH RISK
-      - 60-89: MEDIUM RISK
-      - < 60: LOW RISK
+    Categorize a final numerical risk score (0-100) into a risk bucket.
+
+    Thresholds are configurable to support dynamic adjustment from the
+    backend's AppSetting table or via the adaptive engine.
+
+    Args:
+        score: Risk score on 0-100 scale.
+        high_threshold: Score at/above which risk is HIGH (default: 80).
+        medium_threshold: Score at/above which risk is MEDIUM (default: 70).
+
+    Returns:
+        One of "HIGH RISK", "MEDIUM RISK", or "LOW RISK".
     """
-    if score >= 80:
+    if score >= high_threshold:
         return "HIGH RISK"
-    elif score >= 70:
+    elif score >= medium_threshold:
         return "MEDIUM RISK"
     else:
         return "LOW RISK"
